@@ -23,7 +23,7 @@ function awaitDelay() { setTimeout(finish, Number(process.env.MOCK_DELAY || 200)
 function finish() {
   if ((mode === 'fallback' || mode === 'fallback-real' || mode === '429-caption' || mode === 'failure-caption') && args.includes('-f')) {
     const out = args[args.indexOf('--output') + 1];
-    if (mode === 'fallback-real') fs.copyFileSync(process.env.AUDIO8_INTEGRATION_AUDIO, out.replace('%(ext)s', 'wav'));
+    if (mode === 'fallback-real') fs.copyFileSync(process.env.WHISPER_INTEGRATION_AUDIO, out.replace('%(ext)s', 'wav'));
     else fs.writeFileSync(out.replace('%(ext)s', 'm4a'), 'audio');
   }
   if (mode !== 'missing' && mode !== 'fallback' && mode !== 'fallback-real' && mode !== '429-caption' && mode !== 'failure-caption' && args.includes('--write-auto-subs')) {
@@ -40,21 +40,16 @@ async function reset(mode) { process.env.MOCK_MODE = mode; await writeFile(log, 
 async function setupFakeAudio(name) {
   const { mkdir } = await import('node:fs/promises');
   const runtime = join(dir, `${name}-model`);
-  await mkdir(join(runtime, 'model_bundle'), { recursive: true });
-  await writeFile(join(runtime, 'asr_onnx_runtime.py'), '');
-  await writeFile(join(runtime, 'model_bundle', 'metadata.json'), '{}');
+  await mkdir(runtime, { recursive: true });
+  await writeFile(join(runtime, 'model.bin'), '');
   const python = join(dir, `${name}-python`);
-  const ffmpeg = join(dir, `${name}-ffmpeg`);
-  await writeFile(python, `#!/usr/bin/env node\nconsole.log(JSON.stringify([{text:'spoken words',offset:0,duration:10000}]))\n`, { mode: 0o755 });
-  await writeFile(ffmpeg, `#!/usr/bin/env node\nrequire('fs').writeFileSync(process.argv.at(-1), 'wav')\n`, { mode: 0o755 });
-  process.env.AUDIO8_RUNTIME = runtime;
-  process.env.AUDIO8_PYTHON = python;
-  process.env.FFMPEG_BIN = ffmpeg;
+  await writeFile(python, `#!/usr/bin/env node\nconsole.log(JSON.stringify({entries:[{text:'spoken words',offset:0,duration:10000}],device:'cpu',transcriptionSeconds:1,language:'en'}))\n`, { mode: 0o755 });
+  process.env.WHISPER_MODEL = runtime;
+  process.env.WHISPER_PYTHON = python;
 }
 function resetFakeAudio() {
-  delete process.env.AUDIO8_RUNTIME;
-  delete process.env.AUDIO8_PYTHON;
-  delete process.env.FFMPEG_BIN;
+  delete process.env.WHISPER_MODEL;
+  delete process.env.WHISPER_PYTHON;
 }
 
 
@@ -69,27 +64,22 @@ test('missing English tries only manual and automatic English once each', async 
   assert.ok(rows.every(a => !a.includes('--list-subs') && a.includes('--retries')));
 });
 
-test('missing captions download audio once and invoke the standalone Audio8 fallback', async () => {
+test('missing captions download audio once and invoke the standalone Whisper Turbo fallback', async () => {
   await reset('fallback');
   const { mkdir } = await import('node:fs/promises');
   const runtime = join(dir, 'model');
-  await mkdir(join(runtime, 'model_bundle'), { recursive: true });
-  await writeFile(join(runtime, 'asr_onnx_runtime.py'), '');
-  await writeFile(join(runtime, 'model_bundle', 'metadata.json'), '{}');
+  await mkdir(runtime, { recursive: true });
+  await writeFile(join(runtime, 'model.bin'), '');
   const python = join(dir, 'fake-python');
-  const ffmpeg = join(dir, 'fake-ffmpeg');
   await writeFile(python, `#!/usr/bin/env node
-console.log(JSON.stringify([{text:'spoken words',offset:0,duration:10000}]))
+console.log(JSON.stringify({entries:[{text:'spoken words',offset:0,duration:10000}],device:'cpu',transcriptionSeconds:1,language:'en'}))
 `, { mode: 0o755 });
-  await writeFile(ffmpeg, `#!/usr/bin/env node
-require('fs').writeFileSync(process.argv.at(-1), 'wav')
-`, { mode: 0o755 });
-  process.env.AUDIO8_RUNTIME = runtime;
-  process.env.AUDIO8_PYTHON = python;
-  process.env.FFMPEG_BIN = ffmpeg;
+  process.env.WHISPER_MODEL = runtime;
+  process.env.WHISPER_PYTHON = python;
   try {
     const entries = await fetchTranscript('https://fallback.example/video');
-    assert.equal(entries.source, 'audio8');
+    assert.equal(entries.source, 'whisper');
+    assert.equal(entries.device, 'cpu');
     assert.equal(entries[0].text, 'spoken words');
     const rows = await calls();
     assert.equal(rows.length, 3);
@@ -99,18 +89,32 @@ require('fs').writeFileSync(process.argv.at(-1), 'wav')
     const { access } = await import('node:fs/promises');
     await assert.rejects(access(directory), /ENOENT/);
   } finally {
-    delete process.env.AUDIO8_RUNTIME;
-    delete process.env.AUDIO8_PYTHON;
-    delete process.env.FFMPEG_BIN;
+    delete process.env.WHISPER_MODEL;
+    delete process.env.WHISPER_PYTHON;
   }
 });
 
-test('real installed Audio8 transcribes downloaded audio through the full fallback', { skip: !process.env.AUDIO8_INTEGRATION_AUDIO, timeout: 120000 }, async () => {
+test('real installed Whisper Turbo transcribes downloaded audio through the full fallback', { skip: !process.env.WHISPER_INTEGRATION_AUDIO, timeout: 120000 }, async () => {
   await reset('fallback-real');
   const entries = await fetchTranscript('https://integration.example/video');
-  assert.equal(entries.source, 'audio8');
+  assert.equal(entries.source, 'whisper');
   assert.match(entries.map(e => e.text).join(' ').toLowerCase(), /quick brown fox/);
   assert.equal((await calls()).length, 3);
+});
+
+test('audio source skips captions and does not reuse caption-first cache', async () => {
+  await reset('fallback');
+  await setupFakeAudio('audio-source');
+  try {
+    const first = await fetchTranscript('https://force-audio.example/video');
+    assert.equal(first.source, 'whisper');
+    const second = await fetchTranscript('https://force-audio.example/video', { source: 'audio' });
+    assert.equal(second.source, 'whisper');
+    const rows = await calls();
+    assert.equal(rows.length, 4);
+    assert.ok(rows[3].includes('-f'));
+    assert.ok(!rows[3].includes('--write-subs'));
+  } finally { resetFakeAudio(); }
 });
 
 test('a 429 stops immediately and blocks subsequent requests to the origin', async () => {
@@ -125,40 +129,35 @@ test('caption 429 immediately falls back to audio while caption cooldown is acti
   await reset('429-caption');
   const { mkdir } = await import('node:fs/promises');
   const runtime = join(dir, 'rate-model');
-  await mkdir(join(runtime, 'model_bundle'), { recursive: true });
-  await writeFile(join(runtime, 'asr_onnx_runtime.py'), '');
-  await writeFile(join(runtime, 'model_bundle', 'metadata.json'), '{}');
+  await mkdir(runtime, { recursive: true });
+  await writeFile(join(runtime, 'model.bin'), '');
   const python = join(dir, 'rate-python');
-  const ffmpeg = join(dir, 'rate-ffmpeg');
-  await writeFile(python, `#!/usr/bin/env node\nconsole.log(JSON.stringify([{text:'spoken words',offset:0,duration:10000}]))\n`, { mode: 0o755 });
-  await writeFile(ffmpeg, `#!/usr/bin/env node\nrequire('fs').writeFileSync(process.argv.at(-1), 'wav')\n`, { mode: 0o755 });
-  process.env.AUDIO8_RUNTIME = runtime;
-  process.env.AUDIO8_PYTHON = python;
-  process.env.FFMPEG_BIN = ffmpeg;
+  await writeFile(python, `#!/usr/bin/env node\nconsole.log(JSON.stringify({entries:[{text:'spoken words',offset:0,duration:10000}],device:'cpu',transcriptionSeconds:1,language:'en'}))\n`, { mode: 0o755 });
+  process.env.WHISPER_MODEL = runtime;
+  process.env.WHISPER_PYTHON = python;
   try {
     const first = await fetchTranscript('https://caption-rate.example/video');
-    assert.equal(first.source, 'audio8');
+    assert.equal(first.source, 'whisper');
     assert.equal(first[0].text, 'spoken words');
     let rows = await calls();
     assert.equal(rows.length, 2);
     assert.ok(rows[0].includes('--write-subs'));
     assert.ok(rows[1].includes('-f'));
     const second = await fetchTranscript('https://caption-rate.example/other');
-    assert.equal(second.source, 'audio8');
+    assert.equal(second.source, 'whisper');
     rows = await calls();
     assert.equal(rows.length, 3, 'caption cooldown skips another caption request');
     assert.ok(rows[2].includes('-f'));
     await reset('failure-caption');
     const third = await fetchTranscript('https://caption-error.example/video');
-    assert.equal(third.source, 'audio8');
+    assert.equal(third.source, 'whisper');
     rows = await calls();
     assert.equal(rows.length, 2);
     assert.ok(rows[0].includes('--write-subs'));
     assert.ok(rows[1].includes('-f'));
   } finally {
-    delete process.env.AUDIO8_RUNTIME;
-    delete process.env.AUDIO8_PYTHON;
-    delete process.env.FFMPEG_BIN;
+    delete process.env.WHISPER_MODEL;
+    delete process.env.WHISPER_PYTHON;
   }
 });
 
@@ -166,7 +165,7 @@ test('audio 429 is reported and independently cooled down', async () => {
   await reset('429');
   await setupFakeAudio('both-limited');
   try {
-    await assert.rejects(fetchTranscript('https://both-limited.example/video'), /Caption fetch.*429.*Audio8 fallback failed.*Audio download.*429/);
+    await assert.rejects(fetchTranscript('https://both-limited.example/video'), /Caption fetch.*429.*Whisper Turbo fallback failed.*Audio download.*429/);
     assert.equal((await calls()).length, 2);
     await assert.rejects(fetchTranscript('https://both-limited.example/other'), /Caption fetch.*rate-limited.*Audio download rate-limited/);
     assert.equal((await calls()).length, 2, 'neither operation retries during its cooldown');
@@ -257,44 +256,17 @@ test('MCP transcript reports both caption and audio rate limits without retrying
   }
 });
 
-test('Audio8 runner covers long audio and splits truncated chunks', async () => {
-  const runtime = join(dir, 'runner-model');
-  const { mkdir } = await import('node:fs/promises');
-  const { execFileSync } = await import('node:child_process');
-  await mkdir(runtime, { recursive: true });
-  await writeFile(join(runtime, 'asr_onnx_runtime.py'), `import io,wave
-class OnnxCacheAsrEngine:
- def __init__(self,*args,**kwargs): pass
- def transcribe(self,data,**kwargs):
-  w=wave.open(io.BytesIO(data),'rb')
-  seconds=w.getnframes()/w.getframerate()
-  return {'hit_stop':seconds<=5,'text':f'{seconds:.1f} seconds'}
-`);
-  const wav = join(dir, 'long.wav');
-  execFileSync('python3', ['-c', `import wave,sys
-with wave.open(sys.argv[1], 'wb') as w:
- w.setnchannels(1); w.setsampwidth(2); w.setframerate(16000); w.writeframes(b'\\0' * (16000 * 21 * 2))`, wav]);
-  const output = execFileSync('python3', ['scripts/audio8-transcribe.py', runtime, wav], { cwd: new URL('..', import.meta.url), encoding: 'utf8' });
-  const entries = JSON.parse(output);
-  assert.deepEqual(entries.map(e => e.offset), [0, 5000, 10000, 15000, 20000]);
-  assert.deepEqual(entries.map(e => e.duration), [5000, 5000, 5000, 5000, 1000]);
-});
-
-test('stop interrupts Audio8 inference and removes temporary audio', async () => {
+test('stop interrupts Whisper Turbo inference and removes temporary audio', async () => {
   await reset('fallback');
   const { mkdir, access } = await import('node:fs/promises');
   const runtime = join(dir, 'cancel-model');
-  await mkdir(join(runtime, 'model_bundle'), { recursive: true });
-  await writeFile(join(runtime, 'asr_onnx_runtime.py'), '');
-  await writeFile(join(runtime, 'model_bundle', 'metadata.json'), '{}');
+  await mkdir(runtime, { recursive: true });
+  await writeFile(join(runtime, 'model.bin'), '');
   const marker = join(dir, 'running-stt');
   const python = join(dir, 'slow-python');
-  const ffmpeg = join(dir, 'cancel-ffmpeg');
   await writeFile(python, `#!/usr/bin/env node\nrequire('fs').writeFileSync(${JSON.stringify(marker)}, String(process.pid)); setInterval(()=>{}, 1000)\n`, { mode: 0o755 });
-  await writeFile(ffmpeg, `#!/usr/bin/env node\nrequire('fs').writeFileSync(process.argv.at(-1), 'wav')\n`, { mode: 0o755 });
-  process.env.AUDIO8_RUNTIME = runtime;
-  process.env.AUDIO8_PYTHON = python;
-  process.env.FFMPEG_BIN = ffmpeg;
+  process.env.WHISPER_MODEL = runtime;
+  process.env.WHISPER_PYTHON = python;
   try {
     const controller = new AbortController();
     const promise = fetchTranscript('https://stop-audio.example/video', { signal: controller.signal });
@@ -310,8 +282,30 @@ test('stop interrupts Audio8 inference and removes temporary audio', async () =>
     const directory = rows[2][rows[2].indexOf('--output') + 1].split('/').slice(0, -1).join('/');
     await assert.rejects(access(directory), /ENOENT/);
   } finally {
-    delete process.env.AUDIO8_RUNTIME;
-    delete process.env.AUDIO8_PYTHON;
-    delete process.env.FFMPEG_BIN;
+    delete process.env.WHISPER_MODEL;
+    delete process.env.WHISPER_PYTHON;
+  }
+});
+
+test('MCP audio mode reports the transcription time and device', async () => {
+  await reset('fallback');
+  await setupFakeAudio('mcp-audio');
+  const { spawn } = await import('node:child_process');
+  const { createInterface } = await import('node:readline');
+  const child = spawn('bun', ['server.mjs'], { cwd: new URL('..', import.meta.url), env: process.env, stdio: ['pipe', 'pipe', 'pipe'] });
+  const lines = createInterface({ input: child.stdout });
+  try {
+    const reply = new Promise((resolve, reject) => {
+      child.once('error', reject);
+      child.once('exit', code => reject(new Error(`server exited ${code}`)));
+      lines.on('line', line => { const msg = JSON.parse(line); if (msg.id === 51) resolve(msg); });
+    });
+    child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id: 51, method: 'tools/call', params: { name: 'transcript', arguments: { url: 'https://mcp-audio.example/video', source: 'audio' } } }) + '\n');
+    const msg = await reply;
+    assert.match(msg.result.content[0].text, /Whisper Turbo segments/);
+    assert.match(msg.result.content[0].text, /Transcription time: 1\.0s \(cpu/);
+    assert.equal((await calls()).length, 1);
+  } finally {
+    lines.close(); child.kill(); resetFakeAudio();
   }
 });

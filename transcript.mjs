@@ -4,7 +4,7 @@
  *
  * Ported from daemon-v3/plugins/youtube/transcript.mjs, adapted for the MCP
  * stdio server: same yt-dlp auto-sub approach (fast — subtitles only, no
- * audio download) and a local Audio8 fallback when captions are absent.
+ * audio download) and a local Whisper Turbo fallback when captions are absent.
  */
 
 import { execFile } from 'node:child_process';
@@ -40,7 +40,7 @@ const positiveMs = (name, fallback) => {
   return Number.isFinite(n) && n > 0 ? n : fallback;
 };
 const execTimeoutMs = positiveMs('YTDLP_TIMEOUT_MS', 60000);
-const audioTimeoutMs = positiveMs('AUDIO8_TIMEOUT_MS', 2 * 60 * 60 * 1000);
+const audioTimeoutMs = positiveMs('WHISPER_TIMEOUT_MS', 2 * 60 * 60 * 1000);
 const projectDir = dirname(fileURLToPath(import.meta.url));
 const cacheMs = positiveMs('TRANSCRIPT_CACHE_MS', 30 * 60 * 1000);
 const cooldownMs = positiveMs('TRANSCRIPT_COOLDOWN_MS', 5 * 60 * 1000);
@@ -110,7 +110,7 @@ function subscribe(entry, signal) {
 /** yt-dlp resolution: env override → installed binary → bundled binary → PATH. */
 const YTDLP_CANDIDATES = [
   process.env.YTDLP_BIN,
-  join(process.env.AUDIO8_HOME || join(__dirname, '.audio8'), 'venv', 'bin', 'yt-dlp'),
+  join(process.env.WHISPER_HOME || join(__dirname, '.whisper'), 'venv', 'bin', 'yt-dlp'),
   join(__dirname, 'yt-dlp'),
 ];
 
@@ -149,7 +149,9 @@ export async function fetchTranscript(target, options = {}) {
   const lang = String(options.lang || 'en').trim();
   if (!/^[a-z0-9]+(?:-[a-z0-9]+)*$/i.test(lang)) throw new Error('Invalid subtitle language code.');
   if (options.signal?.aborted) throw new Error('Transcript request cancelled.');
-  const key = `${url}\0${lang.toLowerCase()}\0${options.fallback === false ? "captions" : "audio8"}`;
+  const source = options.source || 'auto';
+  if (!['auto', 'audio'].includes(source)) throw new Error('Source must be auto or audio.');
+  const key = `${url}\0${lang.toLowerCase()}\0${options.fallback === false ? 'captions' : source}`;
   const cached = cache.get(key);
   if (cached && cached.until > Date.now()) return cached.entries;
   if (cached) cache.delete(key);
@@ -159,7 +161,7 @@ export async function fetchTranscript(target, options = {}) {
     const controller = new AbortController();
     entry = { controller, users: 0, done: false, promise: null };
     const current = entry;
-    entry.promise = downloadTranscript(url, lang, controller.signal, options.fallback !== false).then(entries => {
+    entry.promise = downloadTranscript(url, lang, controller.signal, options.fallback !== false, source).then(entries => {
       if (!controller.signal.aborted) {
         cache.delete(key);
         cache.set(key, { entries, until: Date.now() + cacheMs });
@@ -175,11 +177,12 @@ export async function fetchTranscript(target, options = {}) {
   return subscribe(entry, options.signal);
 }
 
-async function downloadTranscript(url, lang, signal, fallback) {
+async function downloadTranscript(url, lang, signal, fallback, source) {
   const deadline = Date.now() + execTimeoutMs;
   const dir = await mkdtemp(join(tmpdir(), 'yt-transcript-'));
   const output = join(dir, 'captions');
   try {
+    if (source === 'audio') return await transcribeAudio(url, dir, signal);
     let captionError;
     try {
       for (const kind of ['--write-subs', '--write-auto-subs']) {
@@ -203,20 +206,20 @@ async function downloadTranscript(url, lang, signal, fallback) {
       return await transcribeAudio(url, dir, signal);
     } catch (err) {
       if (signal.aborted) throw new Error('Transcript request cancelled.');
-      throw new Error(`Caption fetch failed: ${captionError.message} Audio8 fallback failed: ${err.message}`);
+      throw new Error(`Caption fetch failed: ${captionError.message} Whisper Turbo fallback failed: ${err.message}`);
     }
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
 }
 
-/** Download audio once and use the installed, local Audio8 runtime. */
+/** Download audio once and transcribe with the installed Whisper Turbo model. */
 async function transcribeAudio(url, dir, signal) {
-  const home = process.env.AUDIO8_HOME || join(projectDir, '.audio8');
-  const python = process.env.AUDIO8_PYTHON || join(home, 'venv', 'bin', 'python');
-  const runtime = process.env.AUDIO8_RUNTIME || join(home, 'model');
-  if (!existsSync(python) || !existsSync(join(runtime, 'asr_onnx_runtime.py')) || !existsSync(join(runtime, 'model_bundle', 'metadata.json'))) {
-    throw new Error('Requested captions are unavailable and Audio8 is not installed. Run ./scripts/install-audio8.sh.');
+  const home = process.env.WHISPER_HOME || join(projectDir, '.whisper');
+  const python = process.env.WHISPER_PYTHON || join(home, 'venv', 'bin', 'python');
+  const model = process.env.WHISPER_MODEL || join(home, 'model');
+  if (!existsSync(python) || !existsSync(join(model, 'model.bin'))) {
+    throw new Error('Whisper Turbo is not installed. Run ./scripts/install-whisper.sh.');
   }
   const deadline = Date.now() + audioTimeoutMs;
   const template = join(dir, 'audio.%(ext)s');
@@ -224,30 +227,38 @@ async function transcribeAudio(url, dir, signal) {
   const files = (await readdir(dir)).filter(name => name.startsWith('audio.') && !name.endsWith('.part') && !name.endsWith('.ytdl'));
   if (files.length !== 1) throw new Error('Audio download did not produce one audio file.');
   const audio = join(dir, files[0]);
-  const wav = join(dir, 'audio16.wav');
-  let ffmpeg = process.env.FFMPEG_BIN;
-  if (!ffmpeg) {
-    const r = await execFileClosed(python, ['-c', 'import imageio_ffmpeg; print(imageio_ffmpeg.get_ffmpeg_exe())'], { signal, timeout: Math.max(1, deadline - Date.now()) });
-    ffmpeg = r.stdout.trim();
+  const left = deadline - Date.now();
+  if (left <= 0) throw new Error('Whisper Turbo transcription timed out.');
+  // CTranslate2 needs CUDA library paths at process start, before Python
+  // imports it. They live in this tool's venv, not another project's venv.
+  const lib = join(home, 'venv', 'lib');
+  let cudaPaths = [];
+  try {
+    const versions = (await readdir(lib)).filter(name => name.startsWith('python'));
+    cudaPaths = versions.flatMap(v => ['cublas', 'cudnn'].map(n => join(lib, v, 'site-packages', 'nvidia', n, 'lib'))).filter(existsSync);
+  } catch (err) { if (err.code !== 'ENOENT') throw err; }
+  const env = { ...process.env, LD_LIBRARY_PATH: [...cudaPaths, process.env.LD_LIBRARY_PATH].filter(Boolean).join(':') };
+  let result;
+  try {
+    result = await execFileClosed(python, [join(projectDir, 'scripts', 'whisper-transcribe.py'), model, audio],
+      { signal, timeout: left, maxBuffer: 10 * 1024 * 1024, env });
+  } catch (err) {
+    if (signal.aborted) throw new Error('Transcript request cancelled.');
+    if (err.killed || Date.now() >= deadline) throw new Error('Whisper Turbo transcription timed out.');
+    throw new Error(`Whisper Turbo failed: ${(err.stderr || err.message || String(err)).trim()}`);
   }
-  async function run(command, args) {
-    const left = deadline - Date.now();
-    if (left <= 0) throw new Error('Audio8 transcription timed out.');
-    try { return await execFileClosed(command, args, { signal, timeout: left, maxBuffer: 10 * 1024 * 1024 }); }
-    catch (err) {
-      if (signal.aborted) throw new Error('Transcript request cancelled.');
-      if (err.killed || Date.now() >= deadline) throw new Error('Audio8 transcription timed out.');
-      throw new Error(`Audio8 fallback failed: ${(err.stderr || err.message || String(err)).trim()}`);
-    }
-  }
-  await run(ffmpeg, ['-nostdin', '-v', 'error', '-y', '-i', audio, '-vn', '-ac', '1', '-ar', '16000', '-c:a', 'pcm_s16le', wav]);
-  const result = await run(python, [join(projectDir, 'scripts', 'audio8-transcribe.py'), runtime, wav]);
-  let entries;
-  try { entries = JSON.parse(result.stdout); } catch { throw new Error('Audio8 returned an invalid transcript.'); }
+  let output;
+  try { output = JSON.parse(result.stdout); } catch { throw new Error('Whisper Turbo returned an invalid transcript.'); }
+  const entries = output.entries;
   if (!Array.isArray(entries) || entries.length === 0 || entries.some(e => typeof e.text !== 'string' || !Number.isFinite(e.offset) || !Number.isFinite(e.duration))) {
-    throw new Error('Audio8 returned no usable transcript.');
+    throw new Error('Whisper Turbo returned no usable transcript.');
   }
-  Object.defineProperty(entries, 'source', { value: 'audio8' });
+  Object.defineProperties(entries, {
+    source: { value: 'whisper' },
+    device: { value: output.device },
+    transcriptionSeconds: { value: output.transcriptionSeconds },
+    language: { value: output.language },
+  });
   return entries;
 }
 

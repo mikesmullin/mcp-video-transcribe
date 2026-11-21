@@ -36,8 +36,8 @@ function formatTranscript(entries, lang) {
     : 0;
   const lines = entries.map((e) => `[${mmss(e.offset)}] ${e.text}`);
   const out = [
-    entries.source === 'audio8'
-      ? `Transcript — ${entries.length} Audio8 segments, ~${mmss(total * 1000)} long; language detected from audio, timestamps approximate`
+    entries.source === 'whisper'
+      ? `Transcript — ${entries.length} Whisper Turbo segments, ~${mmss(total * 1000)} long, language: ${entries.language || "detected automatically"}\nTranscription time: ${Number(entries.transcriptionSeconds).toFixed(1)}s (${entries.device || "unknown device"}; includes model loading and inference, excludes download)`
       : `Transcript — ${entries.length} caption segments, ~${mmss(total * 1000)} long, language: ${lang || 'en'}`,
     '',
     lines.join('\n'),
@@ -56,7 +56,8 @@ const tools = {
       `other site yt-dlp supports). ` +
       `The url is a full video page URL (a bare YouTube video ID also ` +
       `works); lang is the requested subtitle language (default "en"). ` +
-      `Only that caption language is fetched; on caption failure, local Audio8 transcribes downloaded audio. ` +
+      `Only that caption language is fetched; on caption failure, local Whisper Turbo transcribes downloaded audio. ` +
+      `Set source to audio to skip captions and transcribe the audio directly. ` +
       `If both caption and audio downloads are rate-limited, do not immediately retry.`,
     inputSchema: {
       type: 'object',
@@ -69,13 +70,17 @@ const tools = {
           type: 'string',
           description: 'Preferred subtitle language code (e.g. "en")',
         },
+        source: {
+          type: 'string', enum: ['auto', 'audio'],
+          description: 'auto uses captions first; audio transcribes the audio directly for comparison',
+        },
       },
       required: ['url'],
     },
-    async handler({ url, lang }, ctx) {
+    async handler({ url, lang, source }, ctx) {
       const target = resolveUrl(url);
       ctx?.notify?.('notifications/started', { text: `fetching transcript for ${target}` });
-      const entries = await fetchTranscript(target, { lang, signal: ctx?.signal });
+      const entries = await fetchTranscript(target, { lang, source, signal: ctx?.signal });
       ctx?.notify?.('notifications/finished', { text: `${entries.length} caption segments` });
       const body = formatTranscript(entries, lang);
       // A full copy on disk, so the transcript survives context compaction:
