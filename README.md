@@ -23,7 +23,7 @@ required — yt-dlp ships bundled.
 
 | Tool | Args | Returns |
 |------|------|---------|
-| `transcript` (as `video_transcribe__transcript`) | `videoId` (ID or full watch/shorts/live URL), optional `lang` (default `en`), optional `maxChars` | `[mm:ss]` segments + full text |
+| `transcript` (as `video_transcribe__transcript`) | `videoId` (ID or full watch/shorts/live URL), optional `lang` (default `en`) | `[mm:ss]` segments + full text |
 | `list_caption_tracks` (as `video_transcribe__list_caption_tracks`) | `videoId` | `code — Language` lines |
 
 Language fallback: requested track → English → any listed auto-caption
@@ -36,7 +36,7 @@ download-and-transcribe pipeline instead.
 Input (`tools/call` → `transcript`):
 
 ```json
-{ "videoId": "https://www.youtube.com/watch?v=ZC7rQ3BYu6I", "maxChars": 4000 }
+{ "videoId": "https://www.youtube.com/watch?v=ZC7rQ3BYu6I" }
 ```
 
 Output (truncated):

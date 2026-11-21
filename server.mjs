@@ -29,7 +29,7 @@ function mmss(ms) {
   return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
 }
 
-function formatTranscript(entries, lang, maxChars = 0) {
+function formatTranscript(entries, lang) {
   const total = entries.length
     ? Math.floor(entries[entries.length - 1].offset / 1000 + entries[entries.length - 1].duration / 1000)
     : 0;
@@ -42,9 +42,6 @@ function formatTranscript(entries, lang, maxChars = 0) {
     '--- full text ---',
     entries.map((e) => e.text).join(' '),
   ].join('\n');
-  if (maxChars > 0 && out.length > maxChars) {
-    return out.slice(0, maxChars).replace(/\s+$/, '') + '\n... (truncated to ' + maxChars + ' chars)';
-  }
   return out;
 }
 
@@ -67,19 +64,15 @@ const tools = {
           type: 'string',
           description: 'Preferred subtitle language code (e.g. "en")',
         },
-        maxChars: {
-          type: 'number',
-          description: 'Optional cap on the returned text length in characters',
-        },
       },
       required: ['videoId'],
     },
-    async handler({ videoId, lang, maxChars }, ctx) {
+    async handler({ videoId, lang }, ctx) {
       const id = extractVideoId(videoId);
       ctx?.notify?.('notifications/started', { text: `fetching transcript for ${id}` });
       const entries = await fetchTranscript(id, { lang });
       ctx?.notify?.('notifications/finished', { text: `${entries.length} caption segments` });
-      return textResult(formatTranscript(entries, lang, maxChars ? Number(maxChars) : 0));
+      return textResult(formatTranscript(entries, lang));
     },
   },
 
