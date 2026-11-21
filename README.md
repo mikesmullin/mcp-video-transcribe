@@ -1,13 +1,14 @@
 # 🎬 mcp-video-transcribe
 
-**Turn any YouTube video into text in ~2 seconds — no downloads, no GPU, no API key.**
+**Turn any captioned video into text in ~2 seconds — no downloads, no GPU, no API key.**
 
 Getting a video into an LLM usually means downloading the whole file,
 extracting the audio, and running a local transcription model for
-minutes. mcp-video-transcribe skips all of that: it pulls YouTube's own
-auto-generated captions straight off the video page and hands them back
-as timestamped text plus one clean full-text block. A 75-minute video
-resolves in about two seconds.
+minutes. mcp-video-transcribe skips all of that: it pulls the page's
+own subtitle track — YouTube auto-captions, X/Twitter captions, or any
+other site yt-dlp supports — and hands it back as timestamped text plus
+one clean full-text block. A 75-minute video resolves in about two
+seconds.
 
 ## Quick start
 
@@ -23,8 +24,8 @@ required — yt-dlp ships bundled.
 
 | Tool | Args | Returns |
 |------|------|---------|
-| `transcript` (as `video_transcribe__transcript`) | `videoId` (ID or full watch/shorts/live URL), optional `lang` (default `en`) | `[mm:ss]` segments + full text |
-| `list_caption_tracks` (as `video_transcribe__list_caption_tracks`) | `videoId` | `code — Language` lines |
+| `transcript` (as `video_transcribe__transcript`) | `url` (full video page URL; a bare YouTube ID also works), optional `lang` (default `en`) | `[mm:ss]` segments + full text |
+| `list_caption_tracks` (as `video_transcribe__list_caption_tracks`) | `url` (same shapes as above) | `code — Language` lines |
 
 Language fallback: requested track → English → any listed auto-caption
 track → error (`No automatic subtitles for …`). Videos with no captions
@@ -36,20 +37,20 @@ download-and-transcribe pipeline instead.
 Input (`tools/call` → `transcript`):
 
 ```json
-{ "videoId": "https://www.youtube.com/watch?v=ZC7rQ3BYu6I" }
+{ "url": "https://x.com/neuralink/status/2123890949029818800" }
 ```
 
 Output (truncated):
 
 ```
-Transcript — 3562 caption segments, ~74:45 long, language: en
+Transcript — 36 caption segments, ~1:59 long, language: en
 
-[0:00] Ladies and gentlemen, uh, we're doing a
-[0:01] Ladies and gentlemen, uh, we're doing a
+[0:00] GTA VI with the brain and a robot arm.
+[0:04] Is this the future?
 ...
 
 --- full text ---
-Ladies and gentlemen, uh, we're doing a few shows here. If you go to ...
+GTA VI with the brain and a robot arm. Is this the future? ...
 ```
 
 ## Notes

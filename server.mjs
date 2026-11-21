@@ -11,17 +11,16 @@
  */
 
 import { runMcpStdioServer, textResult } from '../mcp/shared/mcp-stdio.mjs';
-import { fetchTranscript, listCaptionTracks, resolveYtdlp } from './transcript.mjs';
+import { fetchTranscript, listCaptionTracks, resolveTarget, resolveYtdlp } from './transcript.mjs';
 
-function extractVideoId(input) {
-  const s = String(input || '').trim();
-  if (!s) throw new Error('videoId is required');
-  if (/^[a-zA-Z0-9_-]{11}$/.test(s)) return s;
-  const url = s.match(/(?:youtu\.be\/|watch\?v=|v=|embed\/|live\/|shorts\/)([a-zA-Z0-9_-]{11})/);
-  if (url) return url[1];
-  const fallback = s.match(/[a-zA-Z0-9_-]{11}/);
-  if (fallback) return fallback[0];
-  throw new Error(`no YouTube video ID found in: ${s}`);
+/**
+ * Resolve the caller's `url` to a fetchable video page URL, reusing the
+ * transcript module's resolver (full URL for any yt-dlp-supported site,
+ * or a bare YouTube video ID). Kept here so the progress notice names
+ * the resolved target, not the raw input.
+ */
+function resolveUrl(input) {
+  return resolveTarget(input);
 }
 
 function mmss(ms) {
@@ -49,28 +48,29 @@ const SERVER_NAME = 'video-transcribe';
 const tools = {
   transcript: {
     description:
-      `Get the full transcript of a YouTube video. ` +
-      `The videoId is an 11-character YouTube ID or a full watch URL; ` +
-      `lang is the preferred subtitle language (default "en"; ` +
-      `falls back to English then any available auto-caption track).`,
+      `Get the transcript of a video page (YouTube, X/Twitter, or any ` +
+      `other site yt-dlp supports, provided the page carries captions). ` +
+      `The url is a full video page URL (a bare YouTube video ID also ` +
+      `works); lang is the preferred subtitle language (default "en", ` +
+      `falling back to English then any available track).`,
     inputSchema: {
       type: 'object',
       properties: {
-        videoId: {
+        url: {
           type: 'string',
-          description: 'YouTube video ID or full watch URL',
+          description: 'Full video page URL (a bare YouTube video ID also works)',
         },
         lang: {
           type: 'string',
           description: 'Preferred subtitle language code (e.g. "en")',
         },
       },
-      required: ['videoId'],
+      required: ['url'],
     },
-    async handler({ videoId, lang }, ctx) {
-      const id = extractVideoId(videoId);
-      ctx?.notify?.('notifications/started', { text: `fetching transcript for ${id}` });
-      const entries = await fetchTranscript(id, { lang });
+    async handler({ url, lang }, ctx) {
+      const target = resolveUrl(url);
+      ctx?.notify?.('notifications/started', { text: `fetching transcript for ${target}` });
+      const entries = await fetchTranscript(target, { lang });
       ctx?.notify?.('notifications/finished', { text: `${entries.length} caption segments` });
       return textResult(formatTranscript(entries, lang));
     },
@@ -78,25 +78,25 @@ const tools = {
 
   list_caption_tracks: {
     description:
-      `List available automatic caption tracks (language codes + names) for a YouTube video. ` +
-      `The videoId is an 11-character YouTube ID or a full watch URL.`,
+      `List available caption tracks (language codes + names) for a video ` +
+      `page (YouTube, X/Twitter, or any other site yt-dlp supports).`,
     inputSchema: {
       type: 'object',
       properties: {
-        videoId: {
+        url: {
           type: 'string',
-          description: 'YouTube video ID or full watch URL',
+          description: 'Full video page URL (a bare YouTube video ID also works)',
         },
       },
-      required: ['videoId'],
+      required: ['url'],
     },
-    async handler({ videoId }) {
-      const id = extractVideoId(videoId);
-      const tracks = await listCaptionTracks(id);
+    async handler({ url }) {
+      const target = resolveUrl(url);
+      const tracks = await listCaptionTracks(target);
       if (tracks.length === 0) {
-        return textResult(`No automatic caption tracks available for ${id}.`);
+        return textResult(`No caption tracks available for ${target}.`);
       }
-      return textResult(tracks.map((t) => `${t.languageCode} — ${t.language}`).join('\n'));
+      return textResult(tracks.map((t) => (t.language ? `${t.languageCode} — ${t.language}` : t.languageCode)).join('\n'));
     },
   },
 };
@@ -105,4 +105,4 @@ process.stderr.write(
   `mcp-video-transcribe: name=${SERVER_NAME} root=${process.cwd()} yt-dlp=${resolveYtdlp()}\n`,
 );
 
-await runMcpStdioServer({ name: 'youtube', version: '0.1.0', tools });
+await runMcpStdioServer({ name: SERVER_NAME, version: '0.1.0', tools });
