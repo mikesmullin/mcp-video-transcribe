@@ -10,6 +10,8 @@
  *   YTDLP_TIMEOUT_MS — per yt-dlp call timeout, ms (default 60000)
  */
 
+import { writeFile } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
 import { runMcpStdioServer, textResult } from '../mcp/shared/mcp-stdio.mjs';
 import { fetchTranscript, listCaptionTracks, resolveTarget, resolveYtdlp } from './transcript.mjs';
 
@@ -72,7 +74,12 @@ const tools = {
       ctx?.notify?.('notifications/started', { text: `fetching transcript for ${target}` });
       const entries = await fetchTranscript(target, { lang });
       ctx?.notify?.('notifications/finished', { text: `${entries.length} caption segments` });
-      return textResult(formatTranscript(entries, lang));
+      const body = formatTranscript(entries, lang);
+      // A full copy on disk, so the transcript survives context compaction:
+      // the agent (or user) can re-read or grep it later via file-io/bash.
+      const filePath = `/tmp/${randomUUID()}.txt`;
+      await writeFile(filePath, body + '\n', 'utf8');
+      return textResult(`Full copy of transcript: ${filePath}\n\n${body}`);
     },
   },
 

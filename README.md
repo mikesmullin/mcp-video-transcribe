@@ -24,7 +24,7 @@ required — yt-dlp ships bundled.
 
 | Tool | Args | Returns |
 |------|------|---------|
-| `transcript` (as `video_transcribe__transcript`) | `url` (full video page URL; a bare YouTube ID also works), optional `lang` (default `en`) | `[mm:ss]` segments + full text |
+| `transcript` (as `video_transcribe__transcript`) | `url` (full video page URL; a bare YouTube ID also works), optional `lang` (default `en`) | `[mm:ss]` segments + full text, plus a `/tmp/*.txt` copy whose path heads the output |
 | `list_caption_tracks` (as `video_transcribe__list_caption_tracks`) | `url` (same shapes as above) | `code — Language` lines |
 
 Language fallback: requested track → English → any listed auto-caption
@@ -43,6 +43,8 @@ Input (`tools/call` → `transcript`):
 Output (truncated):
 
 ```
+Full copy of transcript: /tmp/3f9d7a1e-4b2c-4e8f-9a1d-7c6e5f0a1b2c.txt
+
 Transcript — 36 caption segments, ~1:59 long, language: en
 
 [0:00] GTA VI with the brain and a robot arm.
