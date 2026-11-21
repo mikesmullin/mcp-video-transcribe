@@ -7,12 +7,12 @@
  *
  * Env:
  *   YTDLP_BIN      — yt-dlp binary (default: ./yt-dlp, then PATH)
- *   YTDLP_TIMEOUT_MS — per yt-dlp call timeout, ms (default 60000)
+ *   YTDLP_TIMEOUT_MS — caption fetch deadline, ms (default 60000)
  */
 
 import { writeFile } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
-import { runMcpStdioServer, textResult } from '../mcp/shared/mcp-stdio.mjs';
+import { runMcpStdioServer, textResult } from './mcp-stdio.mjs';
 import { fetchTranscript, listCaptionTracks, resolveTarget, resolveYtdlp } from './transcript.mjs';
 
 /**
@@ -36,7 +36,9 @@ function formatTranscript(entries, lang) {
     : 0;
   const lines = entries.map((e) => `[${mmss(e.offset)}] ${e.text}`);
   const out = [
-    `Transcript — ${entries.length} caption segments, ~${mmss(total * 1000)} long, language: ${lang || 'en'}`,
+    entries.source === 'audio8'
+      ? `Transcript — ${entries.length} Audio8 segments, ~${mmss(total * 1000)} long; language detected from audio, timestamps approximate`
+      : `Transcript — ${entries.length} caption segments, ~${mmss(total * 1000)} long, language: ${lang || 'en'}`,
     '',
     lines.join('\n'),
     '',
@@ -51,10 +53,11 @@ const tools = {
   transcript: {
     description:
       `Get the transcript of a video page (YouTube, X/Twitter, or any ` +
-      `other site yt-dlp supports, provided the page carries captions). ` +
+      `other site yt-dlp supports). ` +
       `The url is a full video page URL (a bare YouTube video ID also ` +
-      `works); lang is the preferred subtitle language (default "en", ` +
-      `falling back to English then any available track).`,
+      `works); lang is the requested subtitle language (default "en"). ` +
+      `Only that caption language is fetched; on caption failure, local Audio8 transcribes downloaded audio. ` +
+      `If both caption and audio downloads are rate-limited, do not immediately retry.`,
     inputSchema: {
       type: 'object',
       properties: {
@@ -72,7 +75,7 @@ const tools = {
     async handler({ url, lang }, ctx) {
       const target = resolveUrl(url);
       ctx?.notify?.('notifications/started', { text: `fetching transcript for ${target}` });
-      const entries = await fetchTranscript(target, { lang });
+      const entries = await fetchTranscript(target, { lang, signal: ctx?.signal });
       ctx?.notify?.('notifications/finished', { text: `${entries.length} caption segments` });
       const body = formatTranscript(entries, lang);
       // A full copy on disk, so the transcript survives context compaction:
@@ -97,9 +100,9 @@ const tools = {
       },
       required: ['url'],
     },
-    async handler({ url }) {
+    async handler({ url }, ctx) {
       const target = resolveUrl(url);
-      const tracks = await listCaptionTracks(target);
+      const tracks = await listCaptionTracks(target, { signal: ctx?.signal });
       if (tracks.length === 0) {
         return textResult(`No caption tracks available for ${target}.`);
       }

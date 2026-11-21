@@ -1,24 +1,23 @@
 # 🎬 mcp-video-transcribe
 
-**Turn any captioned video into text in ~2 seconds — no downloads, no GPU, no API key.**
+**Turn a video into text using captions or a local Audio8 speech model.**
 
-Getting a video into an LLM usually means downloading the whole file,
-extracting the audio, and running a local transcription model for
-minutes. mcp-video-transcribe skips all of that: it pulls the page's
-own subtitle track — YouTube auto-captions, X/Twitter captions, or any
-other site yt-dlp supports — and hands it back as timestamped text plus
-one clean full-text block. A 75-minute video resolves in about two
-seconds.
+The tool first fetches captions in the requested language. If neither manual
+nor automatic captions are available, it downloads the audio track and runs
+Audio8-ASR locally on the CPU. No external transcription service is needed.
 
 ## Quick start
 
 ```bash
-bun /workspace/mcp-video-transcribe/server.mjs
+./scripts/install-audio8.sh  # one-time: install CPU runtime, model, yt-dlp, and ffmpeg
+node server.mjs
 ```
 
 The server speaks newline-delimited JSON-RPC over stdio (`tools/list` +
-`tools/call`), so any MCP-capable host can spawn it directly. No config
-required — yt-dlp ships bundled.
+`tools/call`), so any MCP-capable host can spawn it directly. Node.js 20+ or Bun is required. The installer needs Python 3.10–3.12
+and internet access; it downloads the Audio8 model (about 645 MB). It uses
+`uv` if available, otherwise Python venv/pip, and installs ffmpeg locally via
+`imageio-ffmpeg`. The runtime is stored in `.audio8/`, outside Git.
 
 ## Tools
 
@@ -27,10 +26,16 @@ required — yt-dlp ships bundled.
 | `transcript` (as `video_transcribe__transcript`) | `url` (full video page URL; a bare YouTube ID also works), optional `lang` (default `en`) | `[mm:ss]` segments + full text, plus a `/tmp/*.txt` copy whose path heads the output |
 | `list_caption_tracks` (as `video_transcribe__list_caption_tracks`) | `url` (same shapes as above) | `code — Language` lines |
 
-Language fallback: requested track → English → any listed auto-caption
-track → error (`No automatic subtitles for …`). Videos with no captions
-at all fail loudly, so the caller knows to fall back to a
-download-and-transcribe pipeline instead.
+Only the requested language is fetched (English by default). Manual subtitles
+are tried first, then automatic captions. If the caption fetch fails or neither
+exists, one audio-only
+download is converted to mono 16 kHz WAV in a private temporary directory and
+transcribed locally in short chunks. Audio8 detects the spoken language; it
+does not translate or guarantee English output. Its timestamps mark chunk
+boundaries and are approximate. A caption HTTP 429 triggers the audio fallback
+immediately and starts a caption cooldown. If the audio download also receives
+a 429, it has a separate cooldown; callers should not immediately retry. Concurrent
+identical requests share work, and successful transcripts are cached in memory.
 
 ## Example
 
@@ -57,5 +62,13 @@ GTA VI with the brain and a robot arm. Is this the future? ...
 
 ## Notes
 
-- yt-dlp resolution: `YTDLP_BIN` env → bundled `./yt-dlp` → `PATH`.
-- `YTDLP_TIMEOUT_MS` sets the per-call timeout in ms (default 60000).
+- yt-dlp resolution: `YTDLP_BIN` → installed `.audio8/venv/bin/yt-dlp` → bundled `./yt-dlp` → `PATH`.
+- `YTDLP_TIMEOUT_MS` sets the caption-fetch deadline in ms (default 60000).
+- `AUDIO8_TIMEOUT_MS` sets the download and inference deadline in ms (default 2 hours).
+- `AUDIO8_HOME` changes the installation directory; `AUDIO8_PYTHON`, `AUDIO8_RUNTIME`, and `FFMPEG_BIN` override individual paths.
+- A long transcription can take minutes or hours on CPU. The MCP host must allow
+  the request to run long enough; cancellation stops the local subprocess.
+- Audio8 is distributed under [CC BY-NC 4.0](https://huggingface.co/Edge0/Audio8-ASR-0.1B-onnx-runtime/blob/main/README.md); commercial use is not permitted by that license.
+- `TRANSCRIPT_CACHE_MS` sets the in-process successful-result cache lifetime (default 30 minutes).
+- `TRANSCRIPT_COOLDOWN_MS` sets the per-origin rate-limit cooldown (default 5 minutes).
+- Cache, cooldown, and request deduplication are local to each server process.

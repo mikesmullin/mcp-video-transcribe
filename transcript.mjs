@@ -4,29 +4,114 @@
  *
  * Ported from daemon-v3/plugins/youtube/transcript.mjs, adapted for the MCP
  * stdio server: same yt-dlp auto-sub approach (fast — subtitles only, no
- * audio download), same VTT parser, plus a language fallback when the
- * requested track isn't available.
+ * audio download) and a local Audio8 fallback when captions are absent.
  */
 
-import { exec } from 'node:child_process';
-import { readFile, unlink } from 'node:fs/promises';
+import { execFile } from 'node:child_process';
+import { readFile, mkdtemp, rm, readdir } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { existsSync } from 'node:fs';
 import { promisify } from 'node:util';
 
-const execAsync = promisify(exec);
+const execFileAsync = promisify(execFile);
+
+// AbortSignal makes Node reject before the child has necessarily exited.
+// Wait for close, escalating to SIGKILL if a subprocess ignores SIGTERM.
+async function execFileClosed(command, args, options) {
+  const pending = execFileAsync(command, args, options);
+  const child = pending.child;
+  const closed = new Promise(resolve => child.once('close', resolve));
+  let timer;
+  const abort = () => { timer = setTimeout(() => child.kill('SIGKILL'), 250); };
+  options.signal?.addEventListener('abort', abort, { once: true });
+  if (options.signal?.aborted) abort();
+  try { return await pending; }
+  catch (err) { await closed; throw err; }
+  finally { clearTimeout(timer); options.signal?.removeEventListener('abort', abort); }
+}
+
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
-const execTimeoutMs = Number(process.env.YTDLP_TIMEOUT_MS || 60000);
+const positiveMs = (name, fallback) => {
+  const n = Number(process.env[name]);
+  return Number.isFinite(n) && n > 0 ? n : fallback;
+};
+const execTimeoutMs = positiveMs('YTDLP_TIMEOUT_MS', 60000);
+const audioTimeoutMs = positiveMs('AUDIO8_TIMEOUT_MS', 2 * 60 * 60 * 1000);
+const projectDir = dirname(fileURLToPath(import.meta.url));
+const cacheMs = positiveMs('TRANSCRIPT_CACHE_MS', 30 * 60 * 1000);
+const cooldownMs = positiveMs('TRANSCRIPT_COOLDOWN_MS', 5 * 60 * 1000);
+const cache = new Map();
+const inFlight = new Map();
+const cooldowns = new Map();
+const MAX_CACHE = 100;
 
-/** yt-dlp resolution: env override → bundled binary → legacy daemon-v3 → PATH. */
+function checkCooldown(url, kind = 'caption') {
+  const origin = `${kind}:${new URL(url).origin}`;
+  const until = cooldowns.get(origin) || 0;
+  if (until > Date.now()) throw new Error(`${kind === 'caption' ? 'Caption fetch' : 'Audio download'} rate-limited; retry after ${new Date(until).toISOString()}. Do not retry immediately.`);
+  cooldowns.delete(origin);
+  return origin;
+}
+
+async function runYtdlp(args, url, deadline, signal, kind = 'caption') {
+  const origin = checkCooldown(url, kind);
+  const remaining = deadline - Date.now();
+  if (remaining <= 0) throw new Error('Transcript request timed out.');
+  try {
+    return await execFileClosed(resolveYtdlp(), [
+      '--no-update', '--retries', '0', '--fragment-retries', '0', '--extractor-retries', '0', ...args,
+    ], { timeout: remaining, signal, maxBuffer: 10 * 1024 * 1024 });
+  } catch (err) {
+    if (signal?.aborted) throw new Error('Transcript request cancelled.');
+    const detail = `${err?.stderr || ''} ${err?.stdout || ''} ${err?.message || ''}`;
+    if (/\b429\b|too many requests/i.test(detail)) {
+      cooldowns.set(origin, Date.now() + cooldownMs);
+      throw new Error(`${kind === 'caption' ? 'Caption fetch' : 'Audio download'} returned HTTP 429 (rate limited). Do not retry for ${Math.ceil(cooldownMs / 1000)} seconds.`);
+    }
+    if (err?.killed || Date.now() >= deadline) throw new Error('Transcript request timed out.');
+    throw new Error(`${kind === 'caption' ? 'Caption fetch' : 'Audio download'} failed: ${(err?.stderr || err?.message || String(err)).trim()}`);
+  }
+}
+
+// A subscriber can stop waiting without cancelling another caller's request.
+// If all subscribers leave, abort the underlying yt-dlp process.
+function subscribe(entry, signal) {
+  if (signal?.aborted) return Promise.reject(new Error('Transcript request cancelled.'));
+  entry.users++;
+  return new Promise((resolve, reject) => {
+    let finished = false;
+    const finish = (fn, value) => {
+      if (finished) return;
+      finished = true;
+      signal?.removeEventListener('abort', abort);
+      entry.users--;
+      if (!entry.users && !entry.done) entry.controller.abort();
+      fn(value);
+    };
+    const abort = () => {
+      const error = new Error('Transcript request cancelled.');
+      if (entry.users === 1 && !entry.done) {
+        // Do not acknowledge the last cancellation until the child has exited
+        // and temporary files have been removed.
+        entry.controller.abort();
+        entry.promise.then(() => finish(reject, error), () => finish(reject, error));
+      } else finish(reject, error);
+    };
+    signal?.addEventListener('abort', abort, { once: true });
+    entry.promise.then(v => finish(resolve, v), e => finish(reject, e));
+    if (signal?.aborted) abort();
+  });
+}
+
+/** yt-dlp resolution: env override → installed binary → bundled binary → PATH. */
 const YTDLP_CANDIDATES = [
   process.env.YTDLP_BIN,
+  join(process.env.AUDIO8_HOME || join(__dirname, '.audio8'), 'venv', 'bin', 'yt-dlp'),
   join(__dirname, 'yt-dlp'),
-  join(__dirname, '..', 'daemon-v3', 'plugins', 'youtube', 'yt-dlp'),
 ];
 
 export function resolveYtdlp() {
@@ -58,75 +143,112 @@ export function resolveTarget(input) {
   throw new Error(`not a video URL or YouTube video ID: ${s}`);
 }
 
-/**
- * Fetch transcript for a video page using yt-dlp subtitles.
- *
- * Tries manual (human-made) subtitles before automatic captions, in the
- * requested language then English, then any listed track. Handles VTT
- * and SRT subtitle files. Works on any site yt-dlp supports, provided
- * the page actually carries a subtitle track.
- *
- * @param {string} target - Full video page URL (or bare YouTube video ID)
- * @param {object} [options]
- * @param {string} [options.lang='en'] Preferred language code
- * @returns {Promise<Array<{text:string, offset:number, duration:number}[]>}
- */
+/** Fetch only the requested language (English by default), manual then auto. */
 export async function fetchTranscript(target, options = {}) {
-  const { lang } = options;
   const url = resolveTarget(target);
-  const ytDlp = resolveYtdlp();
-  const slug = encodeURIComponent(url).slice(-60);
-
-  // One subtitle fetch: manual (`--write-subs`) or automatic
-  // (`--write-auto-subs`). A miss writes no file, which readFile turns
-  // into the skip the fallback chain runs on.
-  const tryFetch = async (subLang, auto) => {
-    const outputTemplate = join(tmpdir(), `yt-transcript-${slug}`) || join(tmpdir(), 'yt-video');
-    const kind = auto ? '--write-auto-subs' : '--write-subs';
-    await execAsync(
-      `"${ytDlp}" --no-update ${kind} --sub-langs "${subLang}" --skip-download --output "${outputTemplate}" "${url}"`,
-      { timeout: execTimeoutMs, maxBuffer: 10 * 1024 * 1024 },
-    );
-    for (const ext of ['vtt', 'srt']) {
-      const path = `${outputTemplate}.${subLang}.${ext}`;
-      try {
-        const content = await readFile(path, 'utf-8');
-        await unlink(path).catch(() => { /* ignore */ });
-        const parsed = ext === 'srt' ? parseSRT(content) : parseVTT(content);
-        if (parsed.length) return parsed;
-      } catch {
-        /* no such file (or empty) — next extension */
+  const lang = String(options.lang || 'en').trim();
+  if (!/^[a-z0-9]+(?:-[a-z0-9]+)*$/i.test(lang)) throw new Error('Invalid subtitle language code.');
+  if (options.signal?.aborted) throw new Error('Transcript request cancelled.');
+  const key = `${url}\0${lang.toLowerCase()}\0${options.fallback === false ? "captions" : "audio8"}`;
+  const cached = cache.get(key);
+  if (cached && cached.until > Date.now()) return cached.entries;
+  if (cached) cache.delete(key);
+  let entry = inFlight.get(key);
+  if (entry?.controller.signal.aborted) { inFlight.delete(key); entry = undefined; }
+  if (!entry) {
+    const controller = new AbortController();
+    entry = { controller, users: 0, done: false, promise: null };
+    const current = entry;
+    entry.promise = downloadTranscript(url, lang, controller.signal, options.fallback !== false).then(entries => {
+      if (!controller.signal.aborted) {
+        cache.delete(key);
+        cache.set(key, { entries, until: Date.now() + cacheMs });
+        while (cache.size > MAX_CACHE) cache.delete(cache.keys().next().value);
       }
-    }
-    return [];
-  };
+      return entries;
+    }).finally(() => {
+      current.done = true;
+      if (inFlight.get(key) === current) inFlight.delete(key);
+    });
+    inFlight.set(key, entry);
+  }
+  return subscribe(entry, options.signal);
+}
 
-  const wanted = [lang || 'en'];
-  if ((lang || '').toLowerCase() !== 'en') wanted.push('en');
-  // Manual subtitles first (human-made), automatic captions second.
-  for (const subLang of wanted) {
-    for (const auto of [false, true]) {
-      try {
-        const t = await tryFetch(subLang, auto);
-        if (t.length) return t;
-      } catch {}
+async function downloadTranscript(url, lang, signal, fallback) {
+  const deadline = Date.now() + execTimeoutMs;
+  const dir = await mkdtemp(join(tmpdir(), 'yt-transcript-'));
+  const output = join(dir, 'captions');
+  try {
+    let captionError;
+    try {
+      for (const kind of ['--write-subs', '--write-auto-subs']) {
+        if (signal.aborted) throw new Error('Transcript request cancelled.');
+        await runYtdlp([kind, '--sub-langs', lang, '--sub-format', 'vtt/srt', '--skip-download', '--output', output, '--', url], url, deadline, signal);
+        for (const ext of ['vtt', 'srt']) {
+          let content;
+          try { content = await readFile(`${output}.${lang}.${ext}`, 'utf-8'); }
+          catch (err) { if (err.code === 'ENOENT') continue; throw err; }
+          const parsed = ext === 'srt' ? parseSRT(content) : parseVTT(content);
+          if (parsed.length) return parsed;
+        }
+      }
+      captionError = new Error(`No ${lang.toLowerCase() === 'en' ? 'English' : lang} transcript available.`);
+    } catch (err) {
+      if (signal.aborted) throw new Error('Transcript request cancelled.');
+      captionError = err;
+    }
+    if (!fallback) throw captionError;
+    try {
+      return await transcribeAudio(url, dir, signal);
+    } catch (err) {
+      if (signal.aborted) throw new Error('Transcript request cancelled.');
+      throw new Error(`Caption fetch failed: ${captionError.message} Audio8 fallback failed: ${err.message}`);
+    }
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+}
+
+/** Download audio once and use the installed, local Audio8 runtime. */
+async function transcribeAudio(url, dir, signal) {
+  const home = process.env.AUDIO8_HOME || join(projectDir, '.audio8');
+  const python = process.env.AUDIO8_PYTHON || join(home, 'venv', 'bin', 'python');
+  const runtime = process.env.AUDIO8_RUNTIME || join(home, 'model');
+  if (!existsSync(python) || !existsSync(join(runtime, 'asr_onnx_runtime.py')) || !existsSync(join(runtime, 'model_bundle', 'metadata.json'))) {
+    throw new Error('Requested captions are unavailable and Audio8 is not installed. Run ./scripts/install-audio8.sh.');
+  }
+  const deadline = Date.now() + audioTimeoutMs;
+  const template = join(dir, 'audio.%(ext)s');
+  await runYtdlp(['--no-playlist', '-f', 'bestaudio/best', '--output', template, '--', url], url, deadline, signal, 'audio');
+  const files = (await readdir(dir)).filter(name => name.startsWith('audio.') && !name.endsWith('.part') && !name.endsWith('.ytdl'));
+  if (files.length !== 1) throw new Error('Audio download did not produce one audio file.');
+  const audio = join(dir, files[0]);
+  const wav = join(dir, 'audio16.wav');
+  let ffmpeg = process.env.FFMPEG_BIN;
+  if (!ffmpeg) {
+    const r = await execFileClosed(python, ['-c', 'import imageio_ffmpeg; print(imageio_ffmpeg.get_ffmpeg_exe())'], { signal, timeout: Math.max(1, deadline - Date.now()) });
+    ffmpeg = r.stdout.trim();
+  }
+  async function run(command, args) {
+    const left = deadline - Date.now();
+    if (left <= 0) throw new Error('Audio8 transcription timed out.');
+    try { return await execFileClosed(command, args, { signal, timeout: left, maxBuffer: 10 * 1024 * 1024 }); }
+    catch (err) {
+      if (signal.aborted) throw new Error('Transcript request cancelled.');
+      if (err.killed || Date.now() >= deadline) throw new Error('Audio8 transcription timed out.');
+      throw new Error(`Audio8 fallback failed: ${(err.stderr || err.message || String(err)).trim()}`);
     }
   }
-  // Any listed track, manual then auto.
-  try {
-    const tracks = await listCaptionTracks(url);
-    for (const t of tracks) {
-      for (const auto of [false, true]) {
-        try {
-          const transcript = await tryFetch(t.languageCode, auto);
-          if (transcript.length) return transcript;
-        } catch {}
-      }
-    }
-  } catch {}
-  throw new Error(
-    `No subtitles for "${url}" (tried "${(lang || 'en')}" plus available tracks)`,
-  );
+  await run(ffmpeg, ['-nostdin', '-v', 'error', '-y', '-i', audio, '-vn', '-ac', '1', '-ar', '16000', '-c:a', 'pcm_s16le', wav]);
+  const result = await run(python, [join(projectDir, 'scripts', 'audio8-transcribe.py'), runtime, wav]);
+  let entries;
+  try { entries = JSON.parse(result.stdout); } catch { throw new Error('Audio8 returned an invalid transcript.'); }
+  if (!Array.isArray(entries) || entries.length === 0 || entries.some(e => typeof e.text !== 'string' || !Number.isFinite(e.offset) || !Number.isFinite(e.duration))) {
+    throw new Error('Audio8 returned no usable transcript.');
+  }
+  Object.defineProperty(entries, 'source', { value: 'audio8' });
+  return entries;
 }
 
 /**
@@ -246,11 +368,9 @@ function parseSRT(srtContent) {
  * @param {string} target - Full video page URL (or bare YouTube video ID)
  * @returns {Promise<Array<{languageCode, language}>>
  */
-export async function listCaptionTracks(target) {
+export async function listCaptionTracks(target, options = {}) {
   const url = resolveTarget(target);
-  const ytDlp = resolveYtdlp();
-  const cmd = `"${ytDlp}" --no-update --list-subs "${url}"`;
-  const { stdout } = await execAsync(cmd, { timeout: execTimeoutMs, maxBuffer: 5 * 1024 * 1024 });
+  const { stdout } = await runYtdlp(['--list-subs', '--', url], url, Date.now() + execTimeoutMs, options.signal);
   // Some sites print a formats column instead of a language name
   // ("en  vtt"); those tokens are not languages.
   const SUB_FORMATS = new Set([
