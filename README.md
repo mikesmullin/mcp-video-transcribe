@@ -42,16 +42,3 @@ chat `.angela/mcp.json` preset (mirrors the other local servers):
   "env": { "YTDLP_TIMEOUT_MS": "60000" }
 }
 ```
-
-## transcribe-local.mjs — local-file fallback (audio8)
-
-`bun /workspace/mcp-video-transcribe/transcribe-local.mjs <audio-or-video-file> [segment_seconds=60]` for
-videos with no captions and local files: ffmpeg → 16 kHz mono WAV → 60 s
-segments → audio8 `transcribe` binary per segment. Same output shape as the
-MCP tool (`[mm:ss]` lines + `--- full text ---` tail).
-
-Measured: 138 s speech → ~8 s wall (~17x realtime incl. per-segment model
-init; longer segments amortize init better). No GPU needed — the 647 MB
-ONNX bundle runs on CPU, leaving VRAM for the LLM. 7 languages: en, zh,
-yue, fr, de, ja, ko (large-v3-turbo on GPU remains the option for the
-other ~90).
